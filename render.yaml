@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: cryptotradebot
+    env: python
+    buildCommand: pip install -e .
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --timeout 120 main:app
+    envVars:
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: cryptotradebot-db
+          property: connectionString
+      - key: TRADING_MODE
+        value: testnet
+      - key: PYTHON_VERSION
+        value: 3.11.0
+
+databases:
+  - name: cryptotradebot-db
+    databaseName: cryptotradebot
+    user: cryptotradebot
