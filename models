@@ -1,0 +1,96 @@
+from app import db
+from datetime import datetime
+from sqlalchemy import func
+from flask_login import UserMixin
+
+class User(UserMixin, db.Model):
+    __tablename__ = 'users'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    name = db.Column(db.String(100), nullable=False)
+    google_id = db.Column(db.String(100), unique=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def __repr__(self):
+        return f'<User {self.email}>'
+
+class Trade(db.Model):
+    __tablename__ = 'trades'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    symbol = db.Column(db.String(20), nullable=False)
+    side = db.Column(db.String(10), nullable=False)  # BUY or SELL
+    quantity = db.Column(db.Float, nullable=False)
+    price = db.Column(db.Float, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    order_id = db.Column(db.String(50))
+    status = db.Column(db.String(20), default='FILLED')
+    pnl = db.Column(db.Float, default=0.0)
+    commission = db.Column(db.Float, default=0.0)
+    
+    def __repr__(self):
+        return f'<Trade {self.symbol} {self.side} {self.quantity}@{self.price}>'
+
+class Position(db.Model):
+    __tablename__ = 'positions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    symbol = db.Column(db.String(20), nullable=False, unique=True)
+    side = db.Column(db.String(10), nullable=False)  # LONG or SHORT
+    quantity = db.Column(db.Float, nullable=False)
+    entry_price = db.Column(db.Float, nullable=False)
+    current_price = db.Column(db.Float, nullable=False)
+    unrealized_pnl = db.Column(db.Float, default=0.0)
+    stop_loss = db.Column(db.Float)
+    take_profit = db.Column(db.Float)
+    opened_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def __repr__(self):
+        return f'<Position {self.symbol} {self.side} {self.quantity}@{self.entry_price}>'
+
+class MarketAnalysis(db.Model):
+    __tablename__ = 'market_analysis'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    symbol = db.Column(db.String(20), nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    timeframe = db.Column(db.String(10), nullable=False)  # 1h, 4h, 1d
+    
+    # Technical indicators
+    rsi = db.Column(db.Float)
+    macd = db.Column(db.Float)
+    macd_signal = db.Column(db.Float)
+    bb_upper = db.Column(db.Float)
+    bb_lower = db.Column(db.Float)
+    bb_middle = db.Column(db.Float)
+    atr = db.Column(db.Float)
+    volume = db.Column(db.Float)
+    
+    # Scores
+    trend_score = db.Column(db.Integer, default=0)
+    momentum_score = db.Column(db.Integer, default=0)
+    volume_score = db.Column(db.Integer, default=0)
+    overall_score = db.Column(db.Integer, default=0)
+    
+    # Signal
+    signal = db.Column(db.String(10))  # BUY, SELL, HOLD
+    
+    def __repr__(self):
+        return f'<Analysis {self.symbol} {self.timeframe} Score:{self.overall_score}>'
+
+class TradingConfig(db.Model):
+    __tablename__ = 'trading_config'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(50), nullable=False, unique=True)
+    value = db.Column(db.Text, nullable=False)
+    description = db.Column(db.Text)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def __repr__(self):
+        return f'<Config {self.key}: {self.value}>'
+
+
