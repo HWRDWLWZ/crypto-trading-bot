@@ -1,0 +1,366 @@
+import ccxt
+import pandas as pd
+import numpy as np
+import logging
+import json
+import os
+from datetime import datetime, timedelta
+from app import db
+from models import Trade, Position, MarketAnalysis, TradingConfig
+from technical_analysis import TechnicalAnalyzer
+from risk_manager import RiskManager
+from config import Config
+import threading
+
+logger = logging.getLogger(__name__)
+
+class TradingBot:
+    def __init__(self):
+        self.config = Config()
+        self.exchange = self._initialize_exchange()
+        self.technical_analyzer = TechnicalAnalyzer()
+        self.risk_manager = RiskManager()
+        self.trading_pairs = self.config.get_trading_pairs()
+        self.timeframes = ['1h', '4h', '1d']
+        
+    def _initialize_exchange(self):
+        """Initialize Binance exchange connection"""
+        try:
+            exchange = ccxt.binance({
+                'apiKey': os.getenv('BINANCE_API_KEY', ''),
+                'secret': os.getenv('BINANCE_SECRET', ''),
+                'sandbox': True,  # Use testnet
+                'enableRateLimit': True,
+                'options': {
+                    'defaultType': 'spot'
+                }
+            })
+            exchange.load_markets()
+            logger.info("Binance Testnet接続成功")
+            return exchange
+        except Exception as e:
+            logger.error(f"Binance接続エラー: {e}")
+            return None
+    
+    def run_analysis_cycle(self):
+        """Run complete analysis cycle for all trading pairs"""
+        logger.info("取引分析サイクル開始...")
+        
+        if not self.exchange:
+            logger.error("取引所接続が無効です")
+            return
+            
+        # Update market data and analyze
+        analysis_results = []
+        
+        # Use threading for concurrent analysis
+        threads = []
+        results_lock = threading.Lock()
+        
+        for symbol in self.trading_pairs:
+            thread = threading.Thread(
+                target=self._analyze_symbol_threaded,
+                args=(symbol, analysis_results, results_lock)
+            )
+            threads.append(thread)
+            thread.start()
+        
+        # Wait for all threads to complete
+        for thread in threads:
+            thread.join()
+        
+        # Process trading signals
+        self._process_trading_signals(analysis_results)
+        
+        # Update existing positions
+        self._update_positions()
+        
+        logger.info(f"分析完了: {len(analysis_results)}ペア処理済み")
+    
+    def _analyze_symbol_threaded(self, symbol, results, lock):
+        """Analyze a single symbol in a separate thread"""
+        try:
+            symbol_results = self._analyze_symbol(symbol)
+            with lock:
+                results.extend(symbol_results)
+        except Exception as e:
+            logger.error(f"{symbol}の分析エラー: {e}")
+    
+    def _analyze_symbol(self, symbol):
+        """Analyze a single trading pair across all timeframes"""
+        results = []
+        
+        try:
+            for timeframe in self.timeframes:
+                # Fetch OHLCV data
+                ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                
+                # Perform technical analysis
+                analysis = self.technical_analyzer.analyze(df, symbol, timeframe)
+                
+                # Store analysis in database
+                self._store_analysis(analysis)
+                results.append(analysis)
+                
+        except Exception as e:
+            logger.error(f"{symbol}の分析エラー ({timeframe}): {e}")
+            
+        return results
+    
+    def _store_analysis(self, analysis):
+        """Store analysis results in database"""
+        try:
+            # Convert numpy types to Python native types
+            def convert_value(value):
+                if hasattr(value, 'item'):  # numpy scalar
+                    return value.item()
+                elif value is None:
+                    return None
+                else:
+                    return float(value) if isinstance(value, (int, float)) else value
+            
+            market_analysis = MarketAnalysis(
+                symbol=analysis['symbol'],
+                timeframe=analysis['timeframe'],
+                rsi=convert_value(analysis.get('rsi')),
+                macd=convert_value(analysis.get('macd')),
+                macd_signal=convert_value(analysis.get('macd_signal')),
+                bb_upper=convert_value(analysis.get('bb_upper')),
+                bb_lower=convert_value(analysis.get('bb_lower')),
+                bb_middle=convert_value(analysis.get('bb_middle')),
+                atr=convert_value(analysis.get('atr')),
+                volume=convert_value(analysis.get('volume')),
+                trend_score=int(analysis.get('trend_score', 0)),
+                momentum_score=int(analysis.get('momentum_score', 0)),
+                volume_score=int(analysis.get('volume_score', 0)),
+                overall_score=int(analysis.get('overall_score', 0)),
+                signal=analysis.get('signal', 'HOLD')
+            )
+            db.session.add(market_analysis)
+            db.session.commit()
+        except Exception as e:
+            logger.error(f"分析データ保存エラー: {e}")
+            db.session.rollback()
+    
+    def _process_trading_signals(self, analysis_results):
+        """Process trading signals and execute trades"""
+        # Group analysis by symbol
+        symbol_analyses = {}
+        for analysis in analysis_results:
+            symbol = analysis['symbol']
+            if symbol not in symbol_analyses:
+                symbol_analyses[symbol] = []
+            symbol_analyses[symbol].append(analysis)
+        
+        for symbol, analyses in symbol_analyses.items():
+            try:
+                # Calculate combined signal strength
+                signal_strength = self._calculate_signal_strength(analyses)
+                
+                if signal_strength['action'] in ['BUY', 'SELL']:
+                    # Check risk management constraints
+                    if self.risk_manager.can_open_position(symbol, signal_strength['action']):
+                        self._execute_trade(symbol, signal_strength)
+                        
+            except Exception as e:
+                logger.error(f"{symbol}のシグナル処理エラー: {e}")
+    
+    def _calculate_signal_strength(self, analyses):
+        """Calculate combined signal strength across timeframes"""
+        total_score = 0
+        buy_signals = 0
+        sell_signals = 0
+        
+        # Weight different timeframes
+        timeframe_weights = {'1h': 1, '4h': 2, '1d': 3}
+        total_weight = 0
+        
+        for analysis in analyses:
+            weight = timeframe_weights.get(analysis['timeframe'], 1)
+            total_weight += weight
+            total_score += analysis.get('overall_score', 0) * weight
+            
+            if analysis.get('signal') == 'BUY':
+                buy_signals += weight
+            elif analysis.get('signal') == 'SELL':
+                sell_signals += weight
+        
+        if total_weight > 0:
+            avg_score = total_score / total_weight
+        else:
+            avg_score = 0
+        
+        # Determine action based on signal strength (lowered thresholds for higher frequency)
+        action = 'HOLD'
+        # Load current config for dynamic thresholds
+        import json
+        try:
+            with open('bot_config.json', 'r') as f:
+                config_data = json.load(f)
+            min_score_buy = config_data.get('risk_management', {}).get('min_score_buy', 70)
+            min_score_sell = config_data.get('risk_management', {}).get('min_score_sell', 70)
+        except:
+            min_score_buy = 70
+            min_score_sell = 70
+        
+        if avg_score >= min_score_buy and buy_signals > sell_signals:
+            action = 'BUY'
+        elif avg_score <= (100 - min_score_sell) and sell_signals > buy_signals:
+            action = 'SELL'
+        
+        return {
+            'action': action,
+            'score': avg_score,
+            'confidence': abs(buy_signals - sell_signals) / max(total_weight, 1)
+        }
+    
+    def _execute_trade(self, symbol, signal):
+        """Execute a trade based on signal"""
+        try:
+            # Get current price
+            ticker = self.exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+            
+            # Calculate position size
+            position_size = self.risk_manager.calculate_position_size(
+                symbol, current_price, signal['action']
+            )
+            
+            if position_size <= 0:
+                return
+            
+            # Place order
+            if signal['action'] == 'BUY':
+                order = self.exchange.create_market_buy_order(symbol, position_size)
+                side = 'LONG'
+            else:
+                order = self.exchange.create_market_sell_order(symbol, position_size)
+                side = 'SHORT'
+            
+            # Store trade
+            self._store_trade(order, symbol, signal['action'])
+            
+            # Create position record
+            self._create_position(symbol, side, position_size, current_price, signal)
+            
+            logger.info(f"取引実行: {symbol} {signal['action']} {position_size}@{current_price}")
+            
+        except Exception as e:
+            logger.error(f"取引実行エラー {symbol}: {e}")
+    
+    def _store_trade(self, order, symbol, side):
+        """Store trade in database"""
+        try:
+            with db.session.begin():
+                trade = Trade(
+                    symbol=symbol,
+                    side=side,
+                    quantity=order['amount'],
+                    price=order['price'] or order['average'],
+                    order_id=order['id'],
+                    status=order['status']
+                )
+                db.session.add(trade)
+        except Exception as e:
+            logger.error(f"取引データ保存エラー: {e}")
+    
+    def _create_position(self, symbol, side, quantity, entry_price, signal):
+        """Create new position record"""
+        try:
+            with db.session.begin():
+                # Calculate stop loss and take profit
+                stop_loss, take_profit = self.risk_manager.calculate_stop_take_profit(
+                    entry_price, side
+                )
+                
+                position = Position(
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    entry_price=entry_price,
+                    current_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
+                )
+                db.session.add(position)
+        except Exception as e:
+            logger.error(f"ポジション作成エラー: {e}")
+    
+    def _update_positions(self):
+        """Update existing positions and check for exit conditions"""
+        try:
+            positions = Position.query.all()
+            
+            for position in positions:
+                try:
+                    # Get current price
+                    ticker = self.exchange.fetch_ticker(position.symbol)
+                    current_price = ticker['last']
+                    
+                    # Update position
+                    position.current_price = current_price
+                    position.unrealized_pnl = self._calculate_unrealized_pnl(position, current_price)
+                    position.updated_at = datetime.utcnow()
+                    
+                    # Check exit conditions
+                    if self._should_exit_position(position, current_price):
+                        self._exit_position(position)
+                    
+                    db.session.commit()
+                    
+                except Exception as e:
+                    logger.error(f"ポジション更新エラー {position.symbol}: {e}")
+                    db.session.rollback()
+                    
+        except Exception as e:
+            logger.error(f"ポジション更新エラー: {e}")
+    
+    def _calculate_unrealized_pnl(self, position, current_price):
+        """Calculate unrealized PnL for a position"""
+        if position.side == 'LONG':
+            return (current_price - position.entry_price) * position.quantity
+        else:
+            return (position.entry_price - current_price) * position.quantity
+    
+    def _should_exit_position(self, position, current_price):
+        """Check if position should be exited"""
+        # Stop loss check
+        if position.side == 'LONG' and current_price <= position.stop_loss:
+            return True
+        if position.side == 'SHORT' and current_price >= position.stop_loss:
+            return True
+            
+        # Take profit check
+        if position.side == 'LONG' and current_price >= position.take_profit:
+            return True
+        if position.side == 'SHORT' and current_price <= position.take_profit:
+            return True
+            
+        return False
+    
+    def _exit_position(self, position):
+        """Exit a position"""
+        try:
+            # Place market order to close position
+            if position.side == 'LONG':
+                order = self.exchange.create_market_sell_order(
+                    position.symbol, position.quantity
+                )
+            else:
+                order = self.exchange.create_market_buy_order(
+                    position.symbol, position.quantity
+                )
+            
+            # Store closing trade
+            self._store_trade(order, position.symbol, 'SELL' if position.side == 'LONG' else 'BUY')
+            
+            # Remove position
+            db.session.delete(position)
+            db.session.commit()
+            
+            logger.info(f"ポジション決済: {position.symbol} {position.side}")
+            
+        except Exception as e:
+            logger.error(f"ポジション決済エラー {position.symbol}: {e}")
