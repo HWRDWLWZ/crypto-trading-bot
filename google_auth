@@ -1,0 +1,177 @@
+# Google Authentication Blueprint - restricted to juyounaindesu@gmail.com
+
+import json
+import os
+from datetime import datetime
+
+import requests
+from app import db
+from flask import Blueprint, redirect, request, url_for, flash, session
+from flask_login import login_required, login_user, logout_user
+from models import User
+from oauthlib.oauth2 import WebApplicationClient
+
+# Google OAuth Configuration
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+GOOGLE_DISCOVERY_URL = "https://accounts.google.com/.well-known/openid-configuration"
+
+# Allowed email - only this account can access the trading bot
+ALLOWED_EMAIL = "juyounaindesu@gmail.com"
+
+# Redirect URL for Replit environment
+if "REPLIT_DEV_DOMAIN" in os.environ:
+    DEV_REDIRECT_URL = f'https://{os.environ["REPLIT_DEV_DOMAIN"]}/google_login/callback'
+else:
+    DEV_REDIRECT_URL = 'http://localhost:5000/google_login/callback'
+
+# Display setup instructions
+print(f"""
+🔐 Google Authentication Setup:
+Access restricted to: {ALLOWED_EMAIL}
+
+To configure Google OAuth:
+1. Go to https://console.cloud.google.com/apis/credentials
+2. Create a new OAuth 2.0 Client ID
+3. Add this redirect URI: {DEV_REDIRECT_URL}
+
+Set environment variables:
+- GOOGLE_OAUTH_CLIENT_ID
+- GOOGLE_OAUTH_CLIENT_SECRET
+""")
+
+client = WebApplicationClient(GOOGLE_CLIENT_ID) if GOOGLE_CLIENT_ID else None
+
+google_auth = Blueprint("google_auth", __name__)
+
+@google_auth.route("/google_login")
+def login():
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        flash("Google OAuth is not configured. Please set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET.", "error")
+        return redirect(url_for("dashboard"))
+    
+    try:
+        # Test Google connectivity first
+        print(f"🔍 Testing Google connectivity...")
+        google_provider_cfg = requests.get(GOOGLE_DISCOVERY_URL, timeout=10).json()
+        authorization_endpoint = google_provider_cfg["authorization_endpoint"]
+        print(f"✅ Google Discovery successful: {authorization_endpoint}")
+        
+        # Use explicit redirect URI
+        redirect_uri = DEV_REDIRECT_URL
+        print(f"🔐 OAuth Login - Redirect URI: {redirect_uri}")
+        print(f"🔐 OAuth Login - Client ID: {GOOGLE_CLIENT_ID[:20]}...")
+
+        # Test client configuration
+        if not client:
+            raise Exception("OAuth client not initialized")
+            
+        request_uri = client.prepare_request_uri(
+            authorization_endpoint,
+            redirect_uri=redirect_uri,
+            scope=["openid", "email", "profile"],
+        )
+        print(f"🔐 OAuth Login - Request URI: {request_uri}")
+        
+        # Validate the generated URL
+        if "client_id" not in request_uri or "redirect_uri" not in request_uri:
+            raise Exception("Invalid OAuth request URI generated")
+            
+        return redirect(request_uri)
+        
+    except Exception as e:
+        print(f"❌ Google OAuth Login Error: {str(e)}")
+        flash(f"Google認証エラー: {str(e)}", "error")
+        return redirect(url_for("dashboard"))
+
+@google_auth.route("/google_login/callback")
+def callback():
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        flash("Google OAuth is not configured.", "error")
+        return redirect(url_for("dashboard"))
+    
+    try:
+        code = request.args.get("code")
+        error = request.args.get("error")
+        
+        if error:
+            print(f"❌ Google OAuth Callback Error: {error}")
+            flash(f"Google認証エラー: {error}", "error")
+            return redirect(url_for("dashboard"))
+            
+        if not code:
+            print("❌ Google OAuth Callback: No authorization code received")
+            flash("認証コードが受信されませんでした", "error")
+            return redirect(url_for("dashboard"))
+            
+        print(f"✅ Google OAuth Callback: Received code: {code[:10]}...")
+        
+        google_provider_cfg = requests.get(GOOGLE_DISCOVERY_URL, timeout=10).json()
+        token_endpoint = google_provider_cfg["token_endpoint"]
+
+        token_url, headers, body = client.prepare_token_request(
+            token_endpoint,
+            authorization_response=request.url.replace("http://", "https://"),
+            redirect_url=request.base_url.replace("http://", "https://"),
+            code=code,
+        )
+        
+        token_response = requests.post(
+            token_url,
+            headers=headers,
+            data=body,
+            auth=(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET),
+        )
+
+        client.parse_request_body_response(json.dumps(token_response.json()))
+
+        userinfo_endpoint = google_provider_cfg["userinfo_endpoint"]
+        uri, headers, body = client.add_token(userinfo_endpoint)
+        userinfo_response = requests.get(uri, headers=headers, data=body)
+
+        userinfo = userinfo_response.json()
+        
+        if not userinfo.get("email_verified"):
+            flash("メールアドレスがGoogleで認証されていません。", "error")
+            return redirect(url_for("dashboard"))
+
+        users_email = userinfo["email"]
+        users_name = userinfo.get("given_name", userinfo.get("name", "User"))
+        google_id = userinfo["sub"]
+
+        # ✅ Access Control: Only allow juyounaindesu@gmail.com
+        if users_email != ALLOWED_EMAIL:
+            flash(f"アクセスが拒否されました。{ALLOWED_EMAIL}のアカウントのみアクセス可能です。", "error")
+            return redirect(url_for("dashboard"))
+
+        # Find or create user
+        user = User.query.filter_by(email=users_email).first()
+        if not user:
+            user = User(
+                email=users_email, 
+                name=users_name, 
+                google_id=google_id,
+                created_at=datetime.utcnow()
+            )
+            db.session.add(user)
+        else:
+            # Update last login
+            user.last_login = datetime.utcnow()
+        
+        db.session.commit()
+        login_user(user)
+        
+        flash(f"ようこそ、{users_name}さん！", "success")
+        return redirect(url_for("dashboard"))
+        
+    except Exception as e:
+        print(f"❌ Google OAuth Callback Error: {str(e)}")
+        flash(f"Google認証エラー: {str(e)}", "error")
+        return redirect(url_for("dashboard"))
+
+@google_auth.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    flash("ログアウトしました。", "info")
+    return redirect(url_for("dashboard"))
